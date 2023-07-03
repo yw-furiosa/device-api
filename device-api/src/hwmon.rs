@@ -135,32 +135,14 @@ impl TryFrom<DirEntry> for MetricEntry {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct Sensor {
-    name: String,
-    items: HashMap<String, PathBuf>,
+    label: String,
+    path: PathBuf,
 }
 
 impl Sensor {
-    fn new(name: String, items: Vec<MetricItem>) -> Self {
-        let mut map = HashMap::new();
-
-        for item in items {
-            map.insert(item.item_name, item.path);
-        }
-
-        Self { name, items: map }
-    }
-
-    async fn read_item(&self, item_name: &str) -> error::HwmonResult<(String, String)> {
-        if let Some(path) = self.items.get(item_name) {
-            let value = tokio::fs::read_to_string(path).await?;
-
-            Ok((self.name.clone(), value.trim().to_string()))
-        } else {
-            Err(error::HwmonError::ItemNameNotFound {
-                sensor_name: self.name.clone(),
-                item_name: item_name.to_string(),
-            })
-        }
+    async fn read_value(&self) -> error::HwmonResult<String> {
+        let value = tokio::fs::read_to_string(self.path.clone()).await?;
+        Ok(value.trim().to_string())
     }
 }
 
@@ -171,19 +153,7 @@ impl SensorContainer {
     async fn new(base_dir: &str, busname: &str) -> error::HwmonResult<Self> {
         let path = hwmon::path(base_dir, busname);
         let entries = Self::fetch_entries(path).await?;
-        let value_map = Self::build_value_map(entries).await;
-
-        let sensors: HashMap<HwmonType, Vec<Sensor>> = value_map
-            .into_iter()
-            .map(|(hwmon_type, v)| {
-                let metrics: Vec<Sensor> = v
-                    .into_iter()
-                    .map(|(sensor_name, items)| Sensor::new(sensor_name, items))
-                    .collect();
-
-                (hwmon_type, metrics)
-            })
-            .collect();
+        let sensors = Self::build_sensors(entries).await;
 
         Ok(SensorContainer(sensors))
     }
@@ -212,38 +182,35 @@ impl SensorContainer {
         Ok(vec)
     }
 
-    async fn build_value_map(
-        entries: Vec<MetricEntry>,
-    ) -> HashMap<HwmonType, Vec<(String, Vec<MetricItem>)>> {
+    async fn build_sensors(entries: Vec<MetricEntry>) -> HashMap<HwmonType, Vec<Sensor>> {
         let (labels, metrics): (Vec<_>, Vec<_>) = entries
             .into_iter()
             .partition(|entry| entry.metric_item.item_name == "label");
         let label_map = Self::build_label_map(labels).await;
 
-        let mut map_by_metric_type = HashMap::new();
-        for entry in metrics {
-            map_by_metric_type
-                .entry(entry.metric_type)
-                .or_insert_with(Vec::new)
-                .push(entry.metric_item);
-        }
+        let map_by_metric_type: HashMap<MetricType, PathBuf> = metrics
+            .iter()
+            .map(|entry| (entry.metric_type, entry.metric_item.path.clone()))
+            .collect();
 
-        let labelled_metrics: Vec<(HwmonType, String, Vec<MetricItem>)> = map_by_metric_type
+        let labelled_metrics: Vec<(HwmonType, String, PathBuf)> = map_by_metric_type
             .into_iter()
             .sorted_by(|a, b| a.0.idx.cmp(&b.0.idx))
-            .map(|(k, items)| {
+            .map(|(k, path)| {
                 let label = label_map
                     .get(&k)
                     .cloned()
                     .unwrap_or_else(|| k.idx.to_string());
 
-                (k.hwmon_type, label, items)
+                (k.hwmon_type, label, path)
             })
             .collect();
 
         let mut res = HashMap::new();
-        for (t, label, items) in labelled_metrics {
-            res.entry(t).or_insert_with(Vec::new).push((label, items));
+        for (t, label, path) in labelled_metrics {
+            res.entry(t)
+                .or_insert_with(Vec::new)
+                .push(Sensor { label, path });
         }
 
         res
@@ -287,42 +254,44 @@ impl Fetcher {
     }
 
     pub async fn read_currents(&self) -> DeviceResult<Vec<SensorValue>> {
-        self.read_values(HwmonType::Current, "input").await
+        self.read_values(HwmonType::Current).await
     }
 
     pub async fn read_voltages(&self) -> DeviceResult<Vec<SensorValue>> {
-        self.read_values(HwmonType::Voltage, "input").await
+        self.read_values(HwmonType::Voltage).await
     }
 
     pub async fn read_powers_average(&self) -> DeviceResult<Vec<SensorValue>> {
-        self.read_values(HwmonType::Power, "average").await
+        self.read_values(HwmonType::Power).await
     }
 
     pub async fn read_temperatures(&self) -> DeviceResult<Vec<SensorValue>> {
-        self.read_values(HwmonType::Temperature, "input").await
+        self.read_values(HwmonType::Temperature).await
     }
 
-    async fn read_values(&self, t: HwmonType, name: &str) -> DeviceResult<Vec<SensorValue>> {
+    async fn read_values(&self, t: HwmonType) -> DeviceResult<Vec<SensorValue>> {
         let mut res = vec![];
 
         if let Some(sensors) = self.sensor_container.get(&t) {
             for sensor in sensors {
-                let (label, value) = sensor
-                    .read_item(name)
+                let value = sensor
+                    .read_value()
                     .await
                     .map_err(|e| DeviceError::hwmon_error(self.device_index, e))?;
-
                 let value: i32 = value.parse().map_err(|_| {
                     DeviceError::hwmon_error(
                         self.device_index,
                         error::HwmonError::UnexpectedValueFormat {
-                            sensor_name: label.clone(),
+                            sensor_name: sensor.label.clone(),
                             value,
                         },
                     )
                 })?;
 
-                res.push(SensorValue { label, value });
+                res.push(SensorValue {
+                    label: sensor.label.clone(),
+                    value,
+                });
             }
         }
 
